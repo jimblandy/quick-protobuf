@@ -29,7 +29,7 @@ impl Default for Syntax {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Frequency {
     Optional,
     Repeated,
@@ -52,9 +52,25 @@ impl MessageIndex {
             })
             .expect("Message index not found")
     }
+
+    fn get_message_mut<'a>(&self, desc: &'a mut FileDescriptor) -> &'a mut Message {
+        let first_message = self
+            .indexes
+            .first()
+            .and_then(move |i| desc.messages.get_mut(*i));
+        self.indexes
+            .iter()
+            .skip(1)
+            .fold(first_message, |cur, next| {
+                cur.and_then(|msg| msg.messages.get_mut(*next))
+            })
+            .expect("Message index not found")
+    }
+
     fn push(&mut self, i: usize) {
         self.indexes.push(i);
     }
+
     fn pop(&mut self) {
         self.indexes.pop();
     }
@@ -368,17 +384,6 @@ impl Field {
         self.packed.unwrap_or(false)
     }
 
-    /// searches if the message must be boxed
-    fn is_leaf(&self, leaf_messages: &[MessageIndex]) -> bool {
-        match self.typ {
-            FieldType::Message(ref m) => match self.frequency {
-                Frequency::Repeated => true,
-                _ => leaf_messages.contains(m),
-            },
-            _ => true,
-        }
-    }
-
     fn sanitize_default(&mut self, desc: &FileDescriptor) -> Result<()> {
         if let Some(ref mut d) = self.default {
             *d = match &*self.typ.rust_type(desc)? {
@@ -656,15 +661,6 @@ pub struct Message {
 }
 
 impl Message {
-    fn is_leaf(&self, leaf_messages: &[MessageIndex]) -> bool {
-        self.imported
-            || self
-                .fields
-                .iter()
-                .chain(self.oneofs.iter().flat_map(|o| o.fields.iter()))
-                .all(|f| f.is_leaf(leaf_messages) || f.deprecated)
-    }
-
     fn has_lifetime(&self, desc: &FileDescriptor, ignore: &mut Vec<MessageIndex>) -> bool {
         if ignore.contains(&&self.index) {
             return false;
@@ -1178,7 +1174,12 @@ impl OneOf {
             writeln!(w, "pub enum OneOf{} {{", self.name)?;
         }
         for f in &self.fields {
-            writeln!(w, "    {}({}),", f.name, f.typ.rust_type(desc)?)?;
+            let rust_type = f.typ.rust_type(desc)?;
+            if f.boxed {
+                writeln!(w, "    {}(Box<{}>),", f.name, rust_type)?;
+            } else {
+                writeln!(w, "    {}({}),", f.name, rust_type)?;
+            }
         }
         writeln!(w, "    None,")?;
         writeln!(w, "}}")?;
@@ -1338,9 +1339,7 @@ impl FileDescriptor {
 
         desc.resolve_types()?;
 
-        let mut leaf_messages = Vec::new();
-        let index = MessageIndex { indexes: vec![] };
-        break_cycles(&index, &mut desc.messages, &mut leaf_messages);
+        desc.break_cycles();
 
         desc.sanity_checks()?;
         desc.set_defaults()?;
@@ -1542,6 +1541,45 @@ impl FileDescriptor {
         }
         for e in &mut self.enums {
             e.sanitize_names();
+        }
+    }
+
+    /// Breaks cycles by adding boxes when necessary
+    ///
+    /// Cycles means one Message calls itself at some point
+    fn break_cycles(&mut self) {
+        let mut processing = Vec::with_capacity(self.messages.len());
+        let mut messages = self
+            .messages
+            .iter()
+            .map(|m| m.index.clone())
+            .collect::<Vec<_>>();
+        while let Some(m) = messages.pop() {
+            messages.extend(m.get_message(self).messages.iter().map(|m| m.index.clone()));
+            processing.push((m.clone(), vec![m]));
+        }
+
+        while let Some((i, ancestors)) = processing.pop() {
+            let msg = i.get_message_mut(self);
+            for f in msg
+                .fields
+                .iter_mut()
+                .chain(msg.oneofs.iter_mut().flat_map(|o| o.fields.iter_mut()))
+                .filter(|f| !f.boxed && f.frequency != Frequency::Repeated)
+            {
+                if let FieldType::Message(ref m) = &f.typ {
+                    if ancestors.contains(m) {
+                        f.frequency = Frequency::Optional;
+                        f.boxed = true;
+                    } else {
+                        if let Some(&mut (_, ref mut m_ancestors)) =
+                            processing.iter_mut().find(|(i, _)| i == m)
+                        {
+                            m_ancestors.push(i.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1763,55 +1801,6 @@ impl FileDescriptor {
             m.write(w, &self)?;
         }
         Ok(())
-    }
-}
-
-/// Breaks cycles by adding boxes when necessary
-///
-/// Cycles means one Message calls itself at some point
-fn break_cycles(
-    index: &MessageIndex,
-    messages: &mut [Message],
-    leaf_messages: &mut Vec<MessageIndex>,
-) {
-    for (i, m) in messages.iter_mut().enumerate() {
-        let mut index = index.clone();
-        index.push(i);
-        break_cycles(&index, &mut m.messages, leaf_messages);
-    }
-
-    let mut undef_messages = (0..messages.len()).collect::<Vec<_>>();
-    while !undef_messages.is_empty() {
-        let len = undef_messages.len();
-        let mut new_undefs = Vec::new();
-        for i in undef_messages {
-            if messages[i].is_leaf(&**leaf_messages) {
-                let mut index = index.clone();
-                index.push(i);
-                leaf_messages.push(index)
-            } else {
-                new_undefs.push(i);
-            }
-        }
-        undef_messages = new_undefs;
-        if len == undef_messages.len() {
-            // try boxing messages, one by one ...
-            let k = undef_messages.pop().unwrap();
-            {
-                let mut m = messages[k].clone();
-                for f in m
-                    .fields
-                    .iter_mut()
-                    .chain(m.oneofs.iter_mut().flat_map(|o| o.fields.iter_mut()))
-                {
-                    if !f.is_leaf(&leaf_messages) {
-                        f.frequency = Frequency::Optional;
-                        f.boxed = true;
-                    }
-                }
-                messages[k] = m;
-            }
-        }
     }
 }
 
